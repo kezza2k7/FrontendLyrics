@@ -1,5 +1,6 @@
 import Defaults from "../../components/Global/Defaults.ts";
 import Session from "../../components/Global/Session.ts";
+import storage from "../storage.ts";
 
 type CachedHost = {
   baseUrl: string;
@@ -67,11 +68,9 @@ async function SendJob(
   jobs: Job[],
   headers: Record<string, string> = {}
 ): Promise<JobResultGetter> {
-  const primary = Defaults.lyrics.api.url;
-  const fallbacks = [
-    "https://coregateway.spicylyrics.org",
-    "https://lcgateway.spikerko.org",
-  ];
+  const apiMode = storage.get("lyricsApiMode")?.toString() ?? "Hosted";
+  const primary = apiMode === "Local" ? Defaults.lyrics.api.localUrl : Defaults.lyrics.api.hostedUrl;
+  const fallbacks: string[] = [];
 
   // Try first host
   let API_BASE = await getActiveApiBaseUrl(primary, fallbacks);
