@@ -1,9 +1,14 @@
 export const isDev = false;
 
+const HOSTED_API_URL = "https://api.spicylyrics.org";
+const LOCAL_API_URL = "http://localhost:3000";
+
 const Defaults = {
   lyrics: {
     api: {
-      url: isDev ? "http://localhost:3000" : "https://api.spicylyrics.org",
+      url: HOSTED_API_URL,
+      hostedUrl: HOSTED_API_URL,
+      localUrl: LOCAL_API_URL,
     },
   },
   CurrentLyricsType: "None",

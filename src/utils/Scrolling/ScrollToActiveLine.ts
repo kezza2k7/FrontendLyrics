@@ -212,6 +212,12 @@ export function ScrollToActiveLine(ScrollSimplebar: any) {
   const sungLines = Lines.filter((line: any) => line.Status === "Sung");
   const oneActiveNoSung = activeLines.length === 1 && sungLines.length === 0;
   const allLinesSung = Lines.every((line: any) => line.Status === "Sung");
+
+  const firstLineStart = (Lines[0] as any)?.StartTime ?? 0;
+  const lastLineStart = (Lines[Lines.length - 1] as any)?.StartTime ?? 0;
+  const isNearTrackStart = ProcessedPosition <= Math.max(firstLineStart + 1500, 5000);
+  const isNearTrackEnd = ProcessedPosition >= Math.max(0, lastLineStart - 1500);
+
   const shouldForceScroll = isForceScrollQueued || lastLine == null;
 
   if (
@@ -264,7 +270,7 @@ export function ScrollToActiveLine(ScrollSimplebar: any) {
 
   // --- NEW: Check conditions to scroll to top ---
 
-  if (allLinesNotSung || oneActiveNoSung) {
+  if ((allLinesNotSung || oneActiveNoSung) && isNearTrackStart) {
     /*  const container = ScrollSimplebar?.getScrollElement() as HTMLElement;
             if (container) {
                 const timeSinceLastScroll = performance.now() - lastUserScrollTime;
@@ -288,7 +294,7 @@ export function ScrollToActiveLine(ScrollSimplebar: any) {
 
   // Check if all lines are sung
 
-  if (allLinesSung) {
+  if (allLinesSung && isNearTrackEnd) {
     /* const container = ScrollSimplebar?.getScrollElement() as HTMLElement;
             if (container) {
                 const timeSinceLastScroll = performance.now() - lastUserScrollTime;
