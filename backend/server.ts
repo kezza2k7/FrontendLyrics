@@ -1,7 +1,7 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import express, { type Request, type Response } from "express";
-import { access, readFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import type { IncomingHttpHeaders } from "node:http";
 import path from "node:path";
 
@@ -104,6 +104,17 @@ type SpotifyTrackMeta = {
   durationMs: number;
 };
 
+type SpicyLyricsUpstreamSnapshot = {
+  requestedAt: string;
+  source: "query" | "route";
+  operation: string;
+  trackId: string;
+  market: string | null;
+  status: number;
+  ok: boolean;
+  data: unknown;
+};
+
 type AppleSongCandidate = {
   id: string;
   name: string;
@@ -143,6 +154,11 @@ const SPOTIFY_META_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 const LOG_ENABLED = process.env.BACKEND_LOGGING !== "false";
 const LOCAL_TTML_DIR = process.env.TTML_DIR?.trim() || "TTML";
+const SPICYLYRICS_UPSTREAM_BASE_URL = process.env.SPICYLYRICS_UPSTREAM_BASE_URL?.trim() || "https://api.spicylyrics.org";
+const SONG_REQUEST_SNAPSHOT_PATH =
+  process.env.SONG_REQUEST_SNAPSHOT_PATH?.trim() || path.resolve(process.cwd(), "backend", "song-requests.json");
+
+let songSnapshotWriteQueue: Promise<void> = Promise.resolve();
 
 function logInfo(scope: string, message: string, meta?: unknown): void {
   if (!LOG_ENABLED) return;
@@ -734,6 +750,233 @@ async function fetchJsonWithFallback(url: URL | string, options: RequestInit = {
   };
 }
 
+function toSpotifyTrackMeta(trackId: string, data: unknown): SpotifyTrackMeta | null {
+  if (typeof data !== "object" || data === null) return null;
+
+  const parsed = data as {
+    id?: string;
+    name?: string;
+    duration_ms?: number;
+    artists?: Array<{ name?: string }>;
+  };
+
+  return {
+    id: parsed.id ?? trackId,
+    name: parsed.name ?? "",
+    artists: Array.isArray(parsed.artists) ? parsed.artists.map((artist) => artist.name ?? "").filter(Boolean) : [],
+    durationMs: Number(parsed.duration_ms ?? 0),
+  };
+}
+
+async function fetchSpotifyTrackFromMainApi(params: {
+  trackId?: string;
+  authorization?: string;
+}): Promise<{ ok: boolean; status: number; data: unknown }> {
+  const { trackId, authorization } = params;
+
+  if (!trackId) {
+    return {
+      ok: false,
+      status: 400,
+      data: { message: "Missing Spotify track id." },
+    };
+  }
+
+  if (!authorization) {
+    return {
+      ok: false,
+      status: 401,
+      data: {
+        message: "Missing Spotify bearer token. Cannot fetch Spotify main track API.",
+      },
+    };
+  }
+
+  const authHeader = authorization.startsWith("Bearer ") ? authorization : `Bearer ${authorization}`;
+  const trackUrl = `https://api.spotify.com/v1/tracks/${trackId}`;
+
+  return await fetchJsonWithFallback(trackUrl, {
+    method: "GET",
+    headers: {
+      Authorization: authHeader,
+      accept: "application/json",
+    },
+  });
+}
+
+async function appendSongRequestSnapshot(snapshot: SpicyLyricsUpstreamSnapshot): Promise<void> {
+  await mkdir(path.dirname(SONG_REQUEST_SNAPSHOT_PATH), { recursive: true });
+
+  let existing: unknown = [];
+  try {
+    const raw = await readFile(SONG_REQUEST_SNAPSHOT_PATH, "utf8");
+    existing = JSON.parse(raw);
+  } catch {
+    existing = [];
+  }
+
+  const snapshots = Array.isArray(existing) ? existing : [];
+  snapshots.push(snapshot);
+
+  await writeFile(SONG_REQUEST_SNAPSHOT_PATH, JSON.stringify(snapshots, null, 2), "utf8");
+}
+
+async function fetchAndStoreSpicyLyricsUpstreamResult(params: {
+  source: "query" | "route";
+  operation: string;
+  trackId?: string;
+  market?: string;
+  authorization?: string;
+  spicyLyricsVersion?: string;
+  variables?: QueryVariables;
+  upstreamRequestHeaders?: IncomingHttpHeaders;
+}): Promise<QueryResult | null> {
+  const { source, operation, trackId, market, authorization, spicyLyricsVersion, variables, upstreamRequestHeaders } = params;
+  if (!trackId) return null;
+
+  const normalizedVersion = await getCachedSpicyLyricsVersion();
+  const incomingAcceptLanguage = normalizeHeaderValue(upstreamRequestHeaders?.["accept-language"]);
+  const incomingOrigin = normalizeHeaderValue(upstreamRequestHeaders?.origin);
+  const incomingReferer = normalizeHeaderValue(upstreamRequestHeaders?.referer);
+  const incomingUserAgent = normalizeHeaderValue(upstreamRequestHeaders?.["user-agent"]);
+  const incomingSecChUa = normalizeHeaderValue(upstreamRequestHeaders?.["sec-ch-ua"]);
+  const incomingSecChUaMobile = normalizeHeaderValue(upstreamRequestHeaders?.["sec-ch-ua-mobile"]);
+  const incomingSecChUaPlatform = normalizeHeaderValue(upstreamRequestHeaders?.["sec-ch-ua-platform"]);
+
+  const spicyHeaders: Record<string, string> = {
+    accept: "*/*",
+    "accept-encoding": "gzip, deflate, br, zstd",
+    "accept-language": incomingAcceptLanguage || "en-GB,en;q=0.9",
+    "Content-Type": "application/json",
+    origin: incomingOrigin || "https://xpui.app.spotify.com",
+    referer: incomingReferer || "https://xpui.app.spotify.com/",
+    priority: "u=1, i",
+    "sec-ch-ua": incomingSecChUa || '"Not(A:Brand";v="8", "Chromium";v="144"',
+    "sec-ch-ua-mobile": incomingSecChUaMobile || "?0",
+    "sec-ch-ua-platform": incomingSecChUaPlatform || '"macOS"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "cross-site",
+    "spicylyrics-version": normalizedVersion,
+    "user-agent":
+      incomingUserAgent ||
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.7559.97 Spotify/1.2.86.502 Safari/537.36",
+  };
+
+  const authHeader = authorization?.startsWith("Bearer ") ? authorization : authorization ? `Bearer ${authorization}` : "";
+  if (authHeader) {
+    spicyHeaders["spicylyrics-webauth"] = authHeader;
+  }
+
+  let resolvedTrackName = variables?.trackName;
+  let resolvedTrackArtists = Array.isArray(variables?.trackArtists) ? variables.trackArtists : undefined;
+  let resolvedTrackDurationMs = variables?.trackDurationMs;
+
+  if ((!resolvedTrackName || !resolvedTrackArtists?.length || !resolvedTrackDurationMs) && authorization) {
+    const metadata = await getSpotifyTrackMeta({ trackId, authorization });
+    if (metadata) {
+      resolvedTrackName = resolvedTrackName || metadata.name;
+      resolvedTrackArtists = resolvedTrackArtists?.length ? resolvedTrackArtists : metadata.artists;
+      resolvedTrackDurationMs = resolvedTrackDurationMs || metadata.durationMs;
+    }
+  }
+
+  // Hosted API is strict; mirror the client's main lyrics query contract.
+  const forwardedOperation = "lyrics";
+  const forwardedVariables: QueryVariables = {
+    id: trackId,
+    auth: "SpicyLyrics-WebAuth",
+    trackName: resolvedTrackName,
+    trackArtists: resolvedTrackArtists,
+    trackDurationMs: resolvedTrackDurationMs,
+  };
+
+  const upstream = await fetchJsonWithFallback(`${SPICYLYRICS_UPSTREAM_BASE_URL}/query`, {
+    method: "POST",
+    headers: spicyHeaders,
+    body: JSON.stringify({
+      queries: [
+        {
+          operation: forwardedOperation,
+          variables: forwardedVariables,
+        },
+      ],
+      client: {
+        version: normalizedVersion || "unknown",
+      },
+    }),
+  });
+
+  const snapshot: SpicyLyricsUpstreamSnapshot = {
+    requestedAt: new Date().toISOString(),
+    source,
+    operation,
+    trackId,
+    market: market ?? null,
+    status: upstream.status,
+    ok: upstream.ok,
+    data: upstream.data,
+  };
+
+  songSnapshotWriteQueue = songSnapshotWriteQueue
+    .then(async () => {
+      await appendSongRequestSnapshot(snapshot);
+    })
+    .catch((error) => {
+      logError("song-snapshot", "Failed to persist song request snapshot", {
+        trackId,
+        operation,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+
+  await songSnapshotWriteQueue;
+
+  if (!upstream.ok) {
+    logWarn("song-snapshot", "SpicyLyrics upstream snapshot stored with non-OK status", {
+      trackId,
+      operation,
+      status: upstream.status,
+      upstreamResponse: upstream.data,
+      forwardedHeaders: summarizeBody(spicyHeaders),
+      forwardedRequest: {
+        operation: forwardedOperation,
+        variables: summarizeBody(forwardedVariables),
+      },
+      path: SONG_REQUEST_SNAPSHOT_PATH,
+    });
+    return null;
+  }
+
+  if (typeof upstream.data !== "object" || upstream.data === null) {
+    return null;
+  }
+
+  const payload = upstream.data as {
+    queries?: Array<{
+      result?: QueryResult;
+    }>;
+  };
+
+  const upstreamResult = payload.queries?.[0]?.result;
+  if (!upstreamResult) {
+    logWarn("song-snapshot", "SpicyLyrics upstream response missing queries[0].result", {
+      trackId,
+      operation,
+      upstreamResponse: upstream.data,
+      path: SONG_REQUEST_SNAPSHOT_PATH,
+    });
+    return null;
+  }
+
+  logInfo("song-snapshot", "Stored SpicyLyrics upstream snapshot", {
+    trackId,
+    operation,
+    path: SONG_REQUEST_SNAPSHOT_PATH,
+  });
+  return upstreamResult;
+}
+
 async function askSpotifyForLyrics(params: {
   trackId?: string;
   market?: string;
@@ -805,18 +1048,12 @@ async function getSpotifyTrackMeta(params: {
     hasAuthorization: Boolean(authorization),
   });
 
-  const authHeader = authorization?.startsWith("Bearer ") ? authorization : `Bearer ${authorization}`;
-  const trackUrl = `https://api.spotify.com/v1/tracks/${trackId}`;
-
-  const result = await fetchJsonWithFallback(trackUrl, {
-    method: "GET",
-    headers: {
-      Authorization: authHeader,
-      accept: "application/json",
-    },
+  const result = await fetchSpotifyTrackFromMainApi({
+    trackId,
+    authorization,
   });
 
-  if (!result.ok || typeof result.data !== "object" || result.data === null) {
+  if (!result.ok) {
     logWarn("spotify-meta", "Spotify metadata lookup failed", {
       trackId,
       status: result.status,
@@ -824,19 +1061,8 @@ async function getSpotifyTrackMeta(params: {
     return null;
   }
 
-  const data = result.data as {
-    id?: string;
-    name?: string;
-    duration_ms?: number;
-    artists?: Array<{ name?: string }>;
-  };
-
-  const meta: SpotifyTrackMeta = {
-    id: data.id ?? trackId,
-    name: data.name ?? "",
-    artists: Array.isArray(data.artists) ? data.artists.map((artist) => artist.name ?? "").filter(Boolean) : [],
-    durationMs: Number(data.duration_ms ?? 0),
-  };
+  const meta = toSpotifyTrackMeta(trackId, result.data);
+  if (!meta) return null;
 
   spotifyMetaCache.set(trackId, { data: meta, expiresAt: Date.now() + SPOTIFY_META_CACHE_TTL_MS });
   return meta;
@@ -1102,6 +1328,27 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
 
   if (operation === "lyrics") {
     const trackId = variables.id || variables.trackId;
+    const spotifyToken = pickAuthTokenFromQuery(variables, carrier);
+
+    const upstreamLyrics = await fetchAndStoreSpicyLyricsUpstreamResult({
+      source: "query",
+      operation,
+      trackId,
+      market: variables.market,
+      authorization: spotifyToken,
+      spicyLyricsVersion: normalizeHeaderValue(carrier.headers["spicylyrics-version"]),
+      variables,
+      upstreamRequestHeaders: carrier.headers,
+    });
+
+    if (upstreamLyrics && upstreamLyrics.httpStatus === 200) {
+      logInfo("query", "Returning lyrics from hosted SpicyLyrics upstream", {
+        operation,
+        trackId,
+      });
+      return upstreamLyrics;
+    }
+
     const localLyrics = await getLocalTtmlLyrics(trackId);
     if (localLyrics) {
       return {
@@ -1111,7 +1358,6 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
       };
     }
 
-    const spotifyToken = pickAuthTokenFromQuery(variables, carrier);
     const appleStorefront = variables.appleStorefront || variables.storefront || "gb";
     const appleAuth = resolveAppleAuth({
       carrier,
@@ -1238,6 +1484,27 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
 
   if (operation === "spotifyLyrics") {
     const trackId = variables.id || variables.trackId;
+    const spotifyToken = pickAuthTokenFromQuery(variables, carrier);
+
+    const upstreamLyrics = await fetchAndStoreSpicyLyricsUpstreamResult({
+      source: "query",
+      operation,
+      trackId,
+      market: variables.market,
+      authorization: spotifyToken,
+      spicyLyricsVersion: normalizeHeaderValue(carrier.headers["spicylyrics-version"]),
+      variables,
+      upstreamRequestHeaders: carrier.headers,
+    });
+
+    if (upstreamLyrics && upstreamLyrics.httpStatus === 200) {
+      logInfo("query", "Returning spotifyLyrics from hosted SpicyLyrics upstream", {
+        operation,
+        trackId,
+      });
+      return upstreamLyrics;
+    }
+
     const localLyrics = await getLocalTtmlLyrics(trackId);
     if (localLyrics) {
       return {
@@ -1250,7 +1517,7 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
     const spotifyResult = await askSpotifyForLyrics({
       trackId,
       market: variables.market || "from_token",
-      authorization: pickAuthTokenFromQuery(variables, carrier),
+      authorization: spotifyToken,
     });
 
     if (spotifyResult.httpStatus === 200) {
@@ -1343,6 +1610,26 @@ app.get("/health", (_req: Request, res: Response) => {
 app.post("/spotify/lyrics", async (req: Request<unknown, unknown, SpotifyLyricsRequest>, res: Response) => {
   try {
     const trackId = req.body?.trackId;
+    const spotifyToken = pickAuthTokenFromQuery({}, req);
+
+    const upstreamLyrics = await fetchAndStoreSpicyLyricsUpstreamResult({
+      source: "route",
+      operation: "spotifyLyrics",
+      trackId,
+      market: req.body?.market,
+      authorization: spotifyToken,
+      spicyLyricsVersion: normalizeHeaderValue(req.headers["spicylyrics-version"]),
+      upstreamRequestHeaders: req.headers,
+    });
+
+    if (upstreamLyrics && upstreamLyrics.httpStatus === 200) {
+      logInfo("route", "POST /spotify/lyrics served by hosted SpicyLyrics upstream", {
+        trackId,
+      });
+      res.status(200).json(upstreamLyrics.data);
+      return;
+    }
+
     const localLyrics = await getLocalTtmlLyrics(trackId);
     if (localLyrics) {
       logInfo("route", "POST /spotify/lyrics served by local TTML", {
@@ -1356,7 +1643,7 @@ app.post("/spotify/lyrics", async (req: Request<unknown, unknown, SpotifyLyricsR
     const result = await askSpotifyForLyrics({
       trackId,
       market: req.body?.market || "from_token",
-      authorization: pickAuthTokenFromQuery({}, req),
+      authorization: spotifyToken,
     });
 
     logInfo("route", "POST /spotify/lyrics result", {
