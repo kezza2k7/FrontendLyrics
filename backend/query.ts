@@ -7,6 +7,7 @@ import {
   isAppleWordByWord,
   searchAppleSongFromSpotifyTrack,
   transformAppleToSpicyLyrics,
+  writeLocalLyricsJson,
 } from "./lyrics/apple.js";
 import {
   askSpotifyForLyrics,
@@ -15,6 +16,8 @@ import {
 } from "./lyrics/spotify.js";
 import { normalizeLyricsForClient, normalizeSpicyLyricsPayload } from "./lyrics/normalize.js";
 import { fetchAndStoreSpicyLyricsUpstreamResult } from "./snapshot.js";
+import { getLyricsFromCache, writeLyricsToCache } from "./cache.js";
+import type { SpicyLineLyrics, SpicySyllableLyrics } from "./types.js";
 
 export async function handleQueryOperation(
   query: QueryInput,
@@ -32,6 +35,22 @@ export async function handleQueryOperation(
     const trackId = variables.id || variables.trackId;
     const spotifyToken = pickAuthTokenFromQuery(variables, carrier);
 
+    // 1. Local TTML (highest priority — covers TTML XML and pre-parsed WBW JSON sidecars)
+    const localLyrics = await getLocalTtmlLyrics(trackId);
+    if (localLyrics) {
+      return { data: normalizeLyricsForClient(localLyrics, trackId), httpStatus: 200, format: "json" };
+    }
+
+    // 2. Cache check
+    if (trackId) {
+      const cached = await getLyricsFromCache(trackId);
+      if (cached) {
+        logInfo("query", "Returning lyrics from cache", { operation, trackId, type: cached.Type });
+        return { data: normalizeLyricsForClient(cached, trackId), httpStatus: 200, format: "json" };
+      }
+    }
+
+    // 3. SpicyLyrics upstream
     const upstreamLyrics = await fetchAndStoreSpicyLyricsUpstreamResult({
       source: "query",
       operation,
@@ -44,23 +63,29 @@ export async function handleQueryOperation(
     });
 
     if (upstreamLyrics && upstreamLyrics.httpStatus === 200) {
-      const normalizedUpstreamLyrics = normalizeSpicyLyricsPayload(upstreamLyrics.data, trackId);
-      logInfo("query", "Returning lyrics from hosted SpicyLyrics upstream", {
+      const normalizedUpstream = normalizeSpicyLyricsPayload(upstreamLyrics.data, trackId) as SpicyLineLyrics | SpicySyllableLyrics | null;
+      const result = normalizedUpstream ?? (normalizeLyricsForClient(upstreamLyrics.data, trackId) as SpicyLineLyrics | SpicySyllableLyrics);
+      const isWBW = result.Type === "Syllable";
+      logInfo("query", "Returning lyrics from SpicyLyrics upstream", {
         operation,
         trackId,
-        normalized: Boolean(normalizedUpstreamLyrics),
+        wordByWord: isWBW,
       });
-      if (normalizedUpstreamLyrics) {
-        return { ...upstreamLyrics, data: normalizedUpstreamLyrics, format: "json" };
+
+      if (trackId) {
+        if (isWBW) {
+          // Word-by-word → persist to local TTML dir (becomes the top-priority source next request)
+          await writeLocalLyricsJson(trackId, result);
+        } else {
+          // Line-only → persist to regular cache
+          await writeLyricsToCache(trackId, result);
+        }
       }
-      return { ...upstreamLyrics, data: normalizeLyricsForClient(upstreamLyrics.data, trackId) };
+
+      return { data: result, httpStatus: 200, format: "json" };
     }
 
-    const localLyrics = await getLocalTtmlLyrics(trackId);
-    if (localLyrics) {
-      return { data: normalizeLyricsForClient(localLyrics, trackId), httpStatus: 200, format: "json" };
-    }
-
+    // 4. Apple Music (SpicyLyrics had no lyrics) — resolve Apple song id
     const appleStorefront = variables.appleStorefront || variables.storefront || "gb";
     const appleAuth = resolveAppleAuth({
       carrier,
@@ -103,13 +128,6 @@ export async function handleQueryOperation(
       }
     }
 
-    if (!appleSongId) {
-      logWarn("query", "Apple lyrics branch skipped because no Apple song id was resolved", {
-        operation,
-        trackId,
-      });
-    }
-
     if (appleSongId) {
       const appleResult = await askAppleForLyrics({
         songId: appleSongId,
@@ -121,6 +139,7 @@ export async function handleQueryOperation(
       if (appleResult.httpStatus === 200) {
         const transformedApple = transformAppleToSpicyLyrics(appleResult.data, trackId || appleSongId);
         if (transformedApple) {
+          const normalized = normalizeLyricsForClient(transformedApple, trackId || appleSongId) as SpicyLineLyrics | SpicySyllableLyrics;
           const wordByWord = isAppleWordByWord(appleResult.data);
           logInfo("query", "Returning Apple lyrics result", {
             operation,
@@ -128,11 +147,8 @@ export async function handleQueryOperation(
             lineCount: transformedApple.Content.length,
             wordByWord,
           });
-          return {
-            data: normalizeLyricsForClient(transformedApple, trackId || appleSongId),
-            httpStatus: 200,
-            format: "json",
-          };
+          if (trackId) await writeLyricsToCache(trackId, normalized);
+          return { data: normalized, httpStatus: 200, format: "json" };
         }
 
         logWarn("query", "Apple returned 200 but payload could not be transformed", {
@@ -146,8 +162,14 @@ export async function handleQueryOperation(
         appleSongId,
         appleStatus: appleResult.httpStatus,
       });
+    } else {
+      logWarn("query", "No Apple song id resolved, falling back to Spotify", {
+        operation,
+        trackId,
+      });
     }
 
+    // 5. Spotify direct (last resort, no cache write)
     const spotifyResult = await askSpotifyForLyrics({
       trackId,
       market: variables.market || "from_token",
@@ -168,12 +190,7 @@ export async function handleQueryOperation(
       };
     }
 
-    logWarn("query", "Spotify lyrics lookup failed", {
-      operation,
-      trackId,
-      status: spotifyResult.httpStatus,
-    });
-
+    logWarn("query", "All lyrics sources failed", { operation, trackId, status: spotifyResult.httpStatus });
     return { data: spotifyResult.data, httpStatus: spotifyResult.httpStatus, format: "json" };
   }
 

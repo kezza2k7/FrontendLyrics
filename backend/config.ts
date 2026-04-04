@@ -8,7 +8,9 @@ export const SPOTIFY_META_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 export const LOG_ENABLED = process.env.BACKEND_LOGGING !== "false";
 export const LOG_SENSITIVE_HEADERS = process.env.LOG_SENSITIVE_HEADERS === "true";
-export const LOCAL_TTML_DIR = process.env.TTML_DIR?.trim() || "TTML";
+export const LYRICS_DIR =
+  process.env.LYRICS_DIR?.trim() ||
+  path.resolve(process.cwd(), "lyrics");
 export const SPICYLYRICS_UPSTREAM_BASE_URL =
   process.env.SPICYLYRICS_UPSTREAM_BASE_URL?.trim() || "https://api.spicylyrics.org";
 export const SONG_REQUEST_SNAPSHOT_PATH =

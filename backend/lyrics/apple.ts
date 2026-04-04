@@ -1,4 +1,4 @@
-import { access, readFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
   AppleSongCandidate,
@@ -9,7 +9,7 @@ import type {
   SpicySyllableLyrics,
   SpotifyTrackMeta,
 } from "../types.js";
-import { LOCAL_TTML_DIR } from "../config.js";
+import { LYRICS_DIR } from "../config.js";
 import { logInfo, logWarn } from "../logger.js";
 import { decodeHtmlEntities, normalizeForCompare, parseAppleTimestampToSeconds } from "../utils.js";
 import { fetchJsonWithFallback } from "../fetch.js";
@@ -254,15 +254,44 @@ export function markAsLocalTtml<T extends SpicyLineLyrics | SpicySyllableLyrics>
   } as T;
 }
 
+export async function writeLocalLyricsJson(
+  trackId: string,
+  lyrics: SpicyLineLyrics | SpicySyllableLyrics
+): Promise<void> {
+  const dir = path.resolve(LYRICS_DIR, trackId);
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, "lyrics.json"), JSON.stringify(lyrics, null, 2), "utf8");
+  logInfo("local-ttml", "Saved pre-parsed lyrics to local TTML dir", {
+    trackId,
+    type: lyrics.Type,
+  });
+}
+
 export async function getLocalTtmlLyrics(
   trackId?: string
 ): Promise<SpicyLineLyrics | SpicySyllableLyrics | null> {
   if (!trackId) return null;
 
+  // Check for pre-parsed JSON sidecar first (written by SpicyLyrics WBW results)
+  const jsonPath = path.resolve(LYRICS_DIR, trackId, "lyrics.json");
+  try {
+    await access(jsonPath);
+    const raw = await readFile(jsonPath, "utf8");
+    const parsed = JSON.parse(raw) as SpicyLineLyrics | SpicySyllableLyrics;
+    logInfo("local-ttml", "Using local pre-parsed lyrics override", {
+      trackId,
+      type: parsed.Type,
+      lineCount: parsed.Content.length,
+    });
+    return parsed;
+  } catch {
+    // No JSON sidecar, try TTML files below.
+  }
+
   const candidates = [
-    path.resolve(process.cwd(), LOCAL_TTML_DIR, trackId, "ttml"),
-    path.resolve(process.cwd(), LOCAL_TTML_DIR, trackId, "ttml.xml"),
-    path.resolve(process.cwd(), LOCAL_TTML_DIR, trackId, "lyrics.ttml"),
+    path.resolve(LYRICS_DIR, trackId, "ttml"),
+    path.resolve(LYRICS_DIR, trackId, "ttml.xml"),
+    path.resolve(LYRICS_DIR, trackId, "lyrics.ttml"),
   ];
 
   for (const candidatePath of candidates) {
