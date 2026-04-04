@@ -57,15 +57,31 @@ function devSettings(SettingsSection: any) {
 function generalSettings(SettingsSection: any) {
   const settings = new SettingsSection("Spicy Lyrics", "spicy-lyrics-settings");
 
+  const apiModeValue = storage.get("lyricsApiMode")?.toString() ?? "Hosted";
+  let modeIndex = 0;
+  if (apiModeValue === "Local") modeIndex = 1;
+  else if (apiModeValue === "Custom") modeIndex = 2;
+
   settings.addDropDown(
     "lyrics-api-mode",
     "Lyrics API Server",
-    ["Hosted (https://api.spicylyrics.org)", "Local (http://localhost:3000)"],
-    storage.get("lyricsApiMode")?.toString() === "Local" ? 1 : 0,
+    ["Hosted (https://api.spicylyrics.org)", "Local (http://localhost:3000)", "Custom"],
+    modeIndex,
     () => {
       const selected = settings.getFieldValue("lyrics-api-mode") as string;
-      const mode = selected.startsWith("Local") ? "Local" : "Hosted";
+      let mode = "Hosted";
+      if (selected.startsWith("Local")) mode = "Local";
+      else if (selected === "Custom") mode = "Custom";
       storage.set("lyricsApiMode", mode);
+    }
+  );
+
+  settings.addInput(
+    "custom-backend-url",
+    "Custom Backend URL (only used if mode is Custom, e.g., http://192.168.1.100:3000)",
+    storage.get("customBackendUrl")?.toString() ?? "",
+    () => {
+      storage.set("customBackendUrl", settings.getFieldValue("custom-backend-url") as string);
     }
   );
 

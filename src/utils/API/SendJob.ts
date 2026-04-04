@@ -69,7 +69,14 @@ async function SendJob(
   headers: Record<string, string> = {}
 ): Promise<JobResultGetter> {
   const apiMode = storage.get("lyricsApiMode")?.toString() ?? "Hosted";
-  const primary = apiMode === "Local" ? Defaults.lyrics.api.localUrl : Defaults.lyrics.api.hostedUrl;
+  let primary: string;
+  if (apiMode === "Local") {
+    primary = Defaults.lyrics.api.localUrl;
+  } else if (apiMode === "Custom") {
+    primary = storage.get("customBackendUrl")?.toString() ?? Defaults.lyrics.api.hostedUrl;
+  } else {
+    primary = Defaults.lyrics.api.hostedUrl;
+  }
   const fallbacks: string[] = [];
 
   // Try first host

@@ -45,7 +45,14 @@ export async function Query(
   headers: Record<string, string> = {}
 ): Promise<QueryResultGetter> {
   const apiMode = storage.get("lyricsApiMode")?.toString() ?? "Hosted";
-  const host = apiMode === "Local" ? Defaults.lyrics.api.localUrl : Defaults.lyrics.api.hostedUrl;
+  let host: string;
+  if (apiMode === "Local") {
+    host = Defaults.lyrics.api.localUrl;
+  } else if (apiMode === "Custom") {
+    host = storage.get("customBackendUrl")?.toString() ?? Defaults.lyrics.api.hostedUrl;
+  } else {
+    host = Defaults.lyrics.api.hostedUrl;
+  }
   const clientVersion = Session.SpicyLyrics.GetCurrentVersion();
 
   log.info("Sending Query request", { queries, host, clientVersion: clientVersion?.Text, headers });
