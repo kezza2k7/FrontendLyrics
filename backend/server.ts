@@ -156,6 +156,7 @@ const SPOTIFY_META_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 let cachedSpicyLyricsVersion: string | null = null;
 
 const LOG_ENABLED = process.env.BACKEND_LOGGING !== "false";
+const LOG_SENSITIVE_HEADERS = process.env.LOG_SENSITIVE_HEADERS === "true";
 const LOCAL_TTML_DIR = process.env.TTML_DIR?.trim() || "TTML";
 const SPICYLYRICS_UPSTREAM_BASE_URL = process.env.SPICYLYRICS_UPSTREAM_BASE_URL?.trim() || "https://api.spicylyrics.org";
 const SONG_REQUEST_SNAPSHOT_PATH =
@@ -202,6 +203,64 @@ function summarizeBody(body: unknown): unknown {
   if (typeof clone.spotifyToken === "string") clone.spotifyToken = "[REDACTED]";
   return clone;
 }
+ // {"queries":[{"operation":"lyrics","variables":{"id":"3CRDbSIZ4r5MsZ0YwxuEkn","auth":"SpicyLyrics-WebAuth"}}],"client":{"version":"5.22.2"}}
+function redactHeaderValue(name: string, value: string): string {
+  if (!value) return value;
+  if (LOG_SENSITIVE_HEADERS) return value;
+
+  const isSensitiveHeader =
+    name.includes("authorization") ||
+    name.includes("webauth") ||
+    name.includes("token") ||
+    name.includes("cookie") ||
+    name.includes("secret") ||
+    name.includes("api-key") ||
+    name.includes("apikey");
+
+  if (!isSensitiveHeader) return value;
+
+  if (/^bearer\s+/i.test(value)) {
+    const token = value.replace(/^bearer\s+/i, "");
+    const suffix = token.length >= 6 ? token.slice(-6) : token;
+    return `Bearer [REDACTED len=${token.length} suffix=${suffix}]`;
+  }
+
+  return "[REDACTED]";
+}
+
+function serializeHeaders(headers?: HeadersInit): Record<string, string> {
+  if (!headers) return {};
+
+  const entries: Array<[string, string]> = [];
+
+  if (headers instanceof Headers) {
+    for (const [name, value] of headers.entries()) {
+      entries.push([name, value]);
+    }
+  } else if (Array.isArray(headers)) {
+    for (const [name, value] of headers) {
+      entries.push([name, String(value)]);
+    }
+  } else {
+    for (const [name, rawValue] of Object.entries(headers)) {
+      if (rawValue === undefined) continue;
+      if (Array.isArray(rawValue)) {
+        entries.push([name, rawValue.join(", ")]);
+      } else {
+        entries.push([name, String(rawValue)]);
+      }
+    }
+  }
+
+  return Object.fromEntries(
+    entries
+      .map(([name, value]) => {
+        const normalizedName = name.toLowerCase();
+        return [normalizedName, redactHeaderValue(normalizedName, value)] as const;
+      })
+      .sort((a, b) => a[0].localeCompare(b[0]))
+  );
+}
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
@@ -226,6 +285,34 @@ function normalizeHeaderValue(value: string | string[] | undefined): string {
   if (!value) return "";
   if (Array.isArray(value)) return value[0]?.trim() ?? "";
   return value.trim();
+}
+
+function isPlaceholderToken(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return true;
+
+  return (
+    normalized.includes("[redacted]") ||
+    normalized.includes("your_token") ||
+    normalized.includes("insert_token") ||
+    normalized.includes("example") ||
+    normalized === "bearer" ||
+    normalized === "bearer null" ||
+    normalized === "bearer undefined" ||
+    normalized === "null" ||
+    normalized === "undefined"
+  );
+}
+
+function pickFirstRealToken(candidates: Array<string | undefined>): string {
+  for (const rawCandidate of candidates) {
+    const candidate = (rawCandidate ?? "").trim();
+    if (!candidate) continue;
+    if (isPlaceholderToken(candidate)) continue;
+    return candidate;
+  }
+
+  return "";
 }
 
 function resolveAppleAuth(params: {
@@ -409,7 +496,8 @@ function isAppleWordByWord(raw: unknown): boolean {
 }
 
 function roundTime(value: number): number {
-  return Math.round(value * 1000) / 1000;
+  const step = 0.2;
+  return Number((Math.round(value / step) * step).toFixed(3));
 }
 
 function extractAppleSongWriters(ttml: string): string[] {
@@ -431,14 +519,14 @@ function extractAppleSongWriters(ttml: string): string[] {
 function normalizeLineTiming(lines: SpicyLineContent[]): void {
   lines.sort((a, b) => a.StartTime - b.StartTime);
 
-  const minDuration = 0.05;
+  const minDuration = 0.2;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     line.StartTime = roundTime(line.StartTime);
     line.EndTime = roundTime(line.EndTime);
 
     if (line.EndTime <= line.StartTime) {
-      line.EndTime = line.StartTime + minDuration;
+      line.EndTime = roundTime(line.StartTime + minDuration);
     }
 
     if (i < lines.length - 1) {
@@ -448,16 +536,18 @@ function normalizeLineTiming(lines: SpicyLineContent[]): void {
         line.EndTime = next.StartTime;
       }
       if (line.EndTime <= line.StartTime) {
-        line.EndTime = line.StartTime + minDuration;
+        line.EndTime = roundTime(line.StartTime + minDuration);
       }
     }
+
+    line.EndTime = roundTime(line.EndTime);
   }
 }
 
 function normalizeSyllableTiming(lines: SpicySyllableContent[]): void {
   lines.sort((a, b) => a.Lead.StartTime - b.Lead.StartTime);
 
-  const minDuration = 0.03;
+  const minDuration = 0.2;
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
     const currentLine = lines[lineIndex];
     const syllables = currentLine.Lead.Syllables.sort((a, b) => a.StartTime - b.StartTime);
@@ -468,7 +558,7 @@ function normalizeSyllableTiming(lines: SpicySyllableContent[]): void {
       current.EndTime = roundTime(current.EndTime);
 
       if (current.EndTime <= current.StartTime) {
-        current.EndTime = current.StartTime + minDuration;
+        current.EndTime = roundTime(current.StartTime + minDuration);
       }
     }
 
@@ -482,18 +572,20 @@ function normalizeSyllableTiming(lines: SpicySyllableContent[]): void {
       }
 
       if (current.EndTime <= current.StartTime) {
-        current.EndTime = current.StartTime + minDuration;
+        current.EndTime = roundTime(current.StartTime + minDuration);
       }
+
+      current.EndTime = roundTime(current.EndTime);
     }
 
     if (syllables.length > 0) {
       const last = syllables[syllables.length - 1];
       if (last.EndTime <= last.StartTime) {
-        last.EndTime = last.StartTime + minDuration;
+        last.EndTime = roundTime(last.StartTime + minDuration);
       }
 
-      currentLine.Lead.StartTime = syllables[0].StartTime;
-      currentLine.Lead.EndTime = last.EndTime;
+      currentLine.Lead.StartTime = roundTime(syllables[0].StartTime);
+      currentLine.Lead.EndTime = roundTime(last.EndTime);
     }
   }
 }
@@ -720,6 +812,8 @@ function transformSpotifyToSpicyLyrics(raw: unknown, trackId?: string): SpicyLin
     };
   });
 
+  normalizeLineTiming(content);
+
   return {
     id: trackId ?? "",
     Type: "Line",
@@ -735,35 +829,161 @@ function transformSpotifyToSpicyLyrics(raw: unknown, trackId?: string): SpicyLin
   };
 }
 
+function normalizeSpicyLyricsPayload(raw: unknown, trackId?: string): SpicyLineLyrics | SpicySyllableLyrics | null {
+  if (!raw || typeof raw !== "object") return null;
+  const source = raw as Record<string, unknown>;
+  const payloadType = source.Type;
+
+  if (payloadType === "Line") {
+    const rawContent = Array.isArray(source.Content) ? source.Content : [];
+    const content: SpicyLineContent[] = rawContent
+      .map((entry) => {
+        if (!entry || typeof entry !== "object") return null;
+        const typed = entry as Record<string, unknown>;
+        const text = typeof typed.Text === "string" ? typed.Text.trim() : "";
+        const start = Number(typed.StartTime ?? 0);
+        const end = Number(typed.EndTime ?? 0);
+        if (!text || !Number.isFinite(start) || !Number.isFinite(end)) return null;
+
+        return {
+          Type: "Vocal",
+          OppositeAligned: Boolean(typed.OppositeAligned),
+          Text: text,
+          StartTime: start,
+          EndTime: end,
+        };
+      })
+      .filter((line): line is SpicyLineContent => Boolean(line));
+
+    if (content.length === 0) return null;
+    normalizeLineTiming(content);
+
+    return {
+      id: typeof source.id === "string" ? source.id : trackId ?? "",
+      Type: "Line",
+      StartTime: content[0]?.StartTime ?? 0,
+      EndTime: content[content.length - 1]?.EndTime ?? 0,
+      Content: content,
+      source: source.source === "aml" || source.source === "spt" ? source.source : "spt",
+      Provider: typeof source.Provider === "string" ? source.Provider : "SpicyLyrics",
+      ProviderDisplayName: typeof source.ProviderDisplayName === "string" ? source.ProviderDisplayName : "SpicyLyrics",
+      Language: typeof source.Language === "string" ? source.Language : "und",
+      IsRtlLanguage: Boolean(source.IsRtlLanguage),
+      IncludesRomanization: Boolean(source.IncludesRomanization),
+      SongWriters: Array.isArray(source.SongWriters)
+        ? source.SongWriters.filter((writer): writer is string => typeof writer === "string")
+        : [],
+    };
+  }
+
+  if (payloadType === "Syllable") {
+    const rawContent = Array.isArray(source.Content) ? source.Content : [];
+    const content: SpicySyllableContent[] = rawContent
+      .map((entry) => {
+        if (!entry || typeof entry !== "object") return null;
+        const typed = entry as Record<string, unknown>;
+        const lead = typed.Lead;
+        if (!lead || typeof lead !== "object") return null;
+        const leadObj = lead as Record<string, unknown>;
+        const rawSyllables = Array.isArray(leadObj.Syllables) ? leadObj.Syllables : [];
+
+        const syllables: SpicySyllable[] = rawSyllables
+          .map((syllable) => {
+            if (!syllable || typeof syllable !== "object") return null;
+            const typedSyllable = syllable as Record<string, unknown>;
+            const text = typeof typedSyllable.Text === "string" ? typedSyllable.Text.trim() : "";
+            const start = Number(typedSyllable.StartTime ?? 0);
+            const end = Number(typedSyllable.EndTime ?? 0);
+            if (!text || !Number.isFinite(start) || !Number.isFinite(end)) return null;
+
+            return {
+              Text: text,
+              StartTime: start,
+              EndTime: end,
+              IsPartOfWord: Boolean(typedSyllable.IsPartOfWord),
+            };
+          })
+          .filter((syllable): syllable is SpicySyllable => Boolean(syllable));
+
+        if (syllables.length === 0) return null;
+
+        return {
+          Type: "Vocal",
+          OppositeAligned: Boolean(typed.OppositeAligned),
+          Lead: {
+            Syllables: syllables,
+            StartTime: Number(leadObj.StartTime ?? syllables[0]?.StartTime ?? 0),
+            EndTime: Number(leadObj.EndTime ?? syllables[syllables.length - 1]?.EndTime ?? 0),
+          },
+        };
+      })
+      .filter((line): line is SpicySyllableContent => Boolean(line));
+
+    if (content.length === 0) return null;
+    normalizeSyllableTiming(content);
+
+    return {
+      id: typeof source.id === "string" ? source.id : trackId ?? "",
+      Type: "Syllable",
+      StartTime: content[0]?.Lead.StartTime ?? 0,
+      EndTime: content[content.length - 1]?.Lead.EndTime ?? 0,
+      Content: content,
+      source: "aml",
+      Provider: typeof source.Provider === "string" ? source.Provider : "SpicyLyrics",
+      ProviderDisplayName: typeof source.ProviderDisplayName === "string" ? source.ProviderDisplayName : "SpicyLyrics",
+      Language: typeof source.Language === "string" ? source.Language : "und",
+      IsRtlLanguage: Boolean(source.IsRtlLanguage),
+      IncludesRomanization: Boolean(source.IncludesRomanization),
+      SongWriters: Array.isArray(source.SongWriters)
+        ? source.SongWriters.filter((writer): writer is string => typeof writer === "string")
+        : [],
+    };
+  }
+
+  return null;
+}
+
+function normalizeLyricsForClient(raw: unknown, trackId?: string): unknown {
+  return normalizeSpicyLyricsPayload(raw, trackId) ?? raw;
+}
+
 function pickAuthTokenFromQuery(variables: QueryVariables = {}, carrier: HeaderCarrier): string {
-  if (typeof variables.auth === "string") {
-    const dynamicHeader = normalizeHeaderValue(carrier.headers[variables.auth.toLowerCase()]);
-    if (dynamicHeader) return dynamicHeader;
-  }
+  const dynamicHeaderValue =
+    typeof variables.auth === "string"
+      ? normalizeHeaderValue(carrier.headers[variables.auth.toLowerCase()])
+      : "";
 
-  const authorization = normalizeHeaderValue(carrier.headers.authorization);
-  if (authorization) return authorization;
+  const authorizationHeader = normalizeHeaderValue(carrier.headers.authorization);
+  const spicyWebAuthHeader = normalizeHeaderValue(carrier.headers["spicylyrics-webauth"]);
 
-  const spicyHeader = normalizeHeaderValue(carrier.headers["spicelyrics-webauth"]);
-  if (spicyHeader) return spicyHeader;
-
-  if (typeof variables.spotifyToken === "string" && variables.spotifyToken.trim()) {
-    return variables.spotifyToken.trim();
-  }
-
-  if (typeof process.env.SPOTIFY_BEARER_TOKEN === "string" && process.env.SPOTIFY_BEARER_TOKEN.trim()) {
-    return process.env.SPOTIFY_BEARER_TOKEN.trim();
-  }
-
-  return "";
+  return pickFirstRealToken([
+    dynamicHeaderValue,
+    authorizationHeader,
+    spicyWebAuthHeader,
+    typeof variables.spotifyToken === "string" ? variables.spotifyToken : "",
+    process.env.SPOTIFY_BEARER_TOKEN,
+  ]);
 }
 
 async function fetchJsonWithFallback(url: URL | string, options: RequestInit = {}) {
   const method = options.method ?? "GET";
   const urlText = typeof url === "string" ? url : url.toString();
-  logInfo("upstream", `Requesting ${method} ${urlText}`);
+  const startedAt = Date.now();
+  const requestHeaders = serializeHeaders(options.headers);
+
+  logInfo("upstream", `Requesting ${method} ${urlText}`, {
+    requestHeaders,
+  });
 
   const res = await fetch(url, options);
+  const responseHeaders = serializeHeaders(res.headers);
+
+  logInfo("upstream", `Received response for ${method} ${urlText}`, {
+    status: res.status,
+    ok: res.ok,
+    durationMs: Date.now() - startedAt,
+    responseHeaders,
+  });
 
   const text = await res.text();
   let data: unknown = text;
@@ -855,6 +1075,7 @@ async function appendSongRequestSnapshot(snapshot: SpicyLyricsUpstreamSnapshot):
 async function fetchAndStoreSpicyLyricsUpstreamResult(params: {
   source: "query" | "route";
   operation: string;
+  rawQuery?: QueryInput;
   trackId?: string;
   market?: string;
   authorization?: string;
@@ -862,7 +1083,7 @@ async function fetchAndStoreSpicyLyricsUpstreamResult(params: {
   variables?: QueryVariables;
   upstreamRequestHeaders?: IncomingHttpHeaders;
 }): Promise<QueryResult | null> {
-  const { source, operation, trackId, market, authorization, spicyLyricsVersion, variables, upstreamRequestHeaders } = params;
+  const { source, operation, rawQuery, trackId, market, authorization, spicyLyricsVersion, variables, upstreamRequestHeaders } = params;
   if (!trackId) return null;
 
   const normalizedVersion = await getCachedSpicyLyricsVersion();
@@ -899,28 +1120,23 @@ async function fetchAndStoreSpicyLyricsUpstreamResult(params: {
     spicyHeaders["spicylyrics-webauth"] = authHeader;
   }
 
-  let resolvedTrackName = variables?.trackName;
-  let resolvedTrackArtists = Array.isArray(variables?.trackArtists) ? variables.trackArtists : undefined;
-  let resolvedTrackDurationMs = variables?.trackDurationMs;
-
-  if ((!resolvedTrackName || !resolvedTrackArtists?.length || !resolvedTrackDurationMs) && authorization) {
-    const metadata = await getSpotifyTrackMeta({ trackId, authorization });
-    if (metadata) {
-      resolvedTrackName = resolvedTrackName || metadata.name;
-      resolvedTrackArtists = resolvedTrackArtists?.length ? resolvedTrackArtists : metadata.artists;
-      resolvedTrackDurationMs = resolvedTrackDurationMs || metadata.durationMs;
-    }
-  }
-
-  // Hosted API is strict; mirror the client's main lyrics query contract.
-  const forwardedOperation = "lyrics";
+  const forwardedOperation = operation || "lyrics";
   const forwardedVariables: QueryVariables = {
     id: trackId,
     auth: "SpicyLyrics-WebAuth",
-    trackName: resolvedTrackName,
-    trackArtists: resolvedTrackArtists,
-    trackDurationMs: resolvedTrackDurationMs,
   };
+
+  console.log(JSON.stringify({
+      queries: [
+        {
+          operation: forwardedOperation,
+          variables: forwardedVariables,
+        },
+      ],
+      client: {
+        version: normalizedVersion || "unknown",
+      },
+    }),)
 
   const upstream = await fetchJsonWithFallback(`${SPICYLYRICS_UPSTREAM_BASE_URL}/query`, {
     method: "POST",
@@ -1364,6 +1580,7 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
     const upstreamLyrics = await fetchAndStoreSpicyLyricsUpstreamResult({
       source: "query",
       operation,
+      rawQuery: query,
       trackId,
       market: variables.market,
       authorization: spotifyToken,
@@ -1373,17 +1590,29 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
     });
 
     if (upstreamLyrics && upstreamLyrics.httpStatus === 200) {
+      const normalizedUpstreamLyrics = normalizeSpicyLyricsPayload(upstreamLyrics.data, trackId);
       logInfo("query", "Returning lyrics from hosted SpicyLyrics upstream", {
         operation,
         trackId,
+        normalized: Boolean(normalizedUpstreamLyrics),
       });
-      return upstreamLyrics;
+      if (normalizedUpstreamLyrics) {
+        return {
+          ...upstreamLyrics,
+          data: normalizedUpstreamLyrics,
+          format: "json",
+        };
+      }
+      return {
+        ...upstreamLyrics,
+        data: normalizeLyricsForClient(upstreamLyrics.data, trackId),
+      };
     }
 
     const localLyrics = await getLocalTtmlLyrics(trackId);
     if (localLyrics) {
       return {
-        data: localLyrics,
+        data: normalizeLyricsForClient(localLyrics, trackId),
         httpStatus: 200,
         format: "json",
       };
@@ -1461,7 +1690,7 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
             wordByWord,
           });
           return {
-            data: transformedApple,
+            data: normalizeLyricsForClient(transformedApple, trackId || appleSongId),
             httpStatus: 200,
             format: "json",
           };
@@ -1494,7 +1723,7 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
         lineCount: transformedSpotify.Content.length,
       });
       return {
-        data: transformedSpotify,
+        data: normalizeLyricsForClient(transformedSpotify, trackId),
         httpStatus: spotifyResult.httpStatus,
         format: "json",
       };
@@ -1520,6 +1749,7 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
     const upstreamLyrics = await fetchAndStoreSpicyLyricsUpstreamResult({
       source: "query",
       operation,
+      rawQuery: query,
       trackId,
       market: variables.market,
       authorization: spotifyToken,
@@ -1529,17 +1759,29 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
     });
 
     if (upstreamLyrics && upstreamLyrics.httpStatus === 200) {
+      const normalizedUpstreamLyrics = normalizeSpicyLyricsPayload(upstreamLyrics.data, trackId);
       logInfo("query", "Returning spotifyLyrics from hosted SpicyLyrics upstream", {
         operation,
         trackId,
+        normalized: Boolean(normalizedUpstreamLyrics),
       });
-      return upstreamLyrics;
+      if (normalizedUpstreamLyrics) {
+        return {
+          ...upstreamLyrics,
+          data: normalizedUpstreamLyrics,
+          format: "json",
+        };
+      }
+      return {
+        ...upstreamLyrics,
+        data: normalizeLyricsForClient(upstreamLyrics.data, trackId),
+      };
     }
 
     const localLyrics = await getLocalTtmlLyrics(trackId);
     if (localLyrics) {
       return {
-        data: localLyrics,
+        data: normalizeLyricsForClient(localLyrics, trackId),
         httpStatus: 200,
         format: "json",
       };
@@ -1559,7 +1801,7 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
         lineCount: transformedSpotify.Content.length,
       });
       return {
-        data: transformedSpotify,
+        data: normalizeLyricsForClient(transformedSpotify, trackId),
         httpStatus: spotifyResult.httpStatus,
         format: "json",
       };
@@ -1573,10 +1815,11 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
   }
 
   if (operation === "appleLyrics") {
-    const localLyrics = await getLocalTtmlLyrics(variables.id || variables.trackId);
+    const appleTrackId = variables.id || variables.trackId;
+    const localLyrics = await getLocalTtmlLyrics(appleTrackId);
     if (localLyrics) {
       return {
-        data: localLyrics,
+        data: normalizeLyricsForClient(localLyrics, appleTrackId),
         httpStatus: 200,
         format: "json",
       };
@@ -1608,7 +1851,7 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
         wordByWord,
       });
       return {
-        data: transformedApple,
+        data: normalizeLyricsForClient(transformedApple, variables.songId || variables.id),
         httpStatus: appleResult.httpStatus,
         format: "json",
       };
@@ -1654,10 +1897,12 @@ app.post("/spotify/lyrics", async (req: Request<unknown, unknown, SpotifyLyricsR
     });
 
     if (upstreamLyrics && upstreamLyrics.httpStatus === 200) {
+      const normalizedUpstreamLyrics = normalizeSpicyLyricsPayload(upstreamLyrics.data, trackId);
       logInfo("route", "POST /spotify/lyrics served by hosted SpicyLyrics upstream", {
         trackId,
+        normalized: Boolean(normalizedUpstreamLyrics),
       });
-      res.status(200).json(upstreamLyrics.data);
+      res.status(200).json(normalizedUpstreamLyrics ?? normalizeLyricsForClient(upstreamLyrics.data, trackId));
       return;
     }
 
@@ -1667,7 +1912,7 @@ app.post("/spotify/lyrics", async (req: Request<unknown, unknown, SpotifyLyricsR
         trackId,
         type: localLyrics.Type,
       });
-      res.status(200).json(localLyrics);
+      res.status(200).json(normalizeLyricsForClient(localLyrics, trackId));
       return;
     }
 
@@ -1684,7 +1929,7 @@ app.post("/spotify/lyrics", async (req: Request<unknown, unknown, SpotifyLyricsR
 
     res
       .status(result.httpStatus)
-      .json(result.httpStatus === 200 ? transformSpotifyToSpicyLyrics(result.data, trackId) : result.data);
+      .json(result.httpStatus === 200 ? normalizeLyricsForClient(transformSpotifyToSpicyLyrics(result.data, trackId), trackId) : result.data);
   } catch (error) {
     logError("route", "POST /spotify/lyrics failed", {
       error: error instanceof Error ? error.message : String(error),
@@ -1723,7 +1968,7 @@ app.post("/apple/lyrics", async (req: Request<unknown, unknown, AppleLyricsReque
       wordByWord,
     });
 
-    res.status(result.httpStatus).json(transformed ?? result.data);
+    res.status(result.httpStatus).json(transformed ? normalizeLyricsForClient(transformed, req.body?.songId) : result.data);
   } catch (error) {
     logError("route", "POST /apple/lyrics failed", {
       error: error instanceof Error ? error.message : String(error),

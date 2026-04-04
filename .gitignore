@@ -173,6 +173,3 @@ __dev-scripts/
 
 # upcoming feature leak..?
 src/components/cli-sync
-
-# generated at build/runtime in some local workflows
-project/config.js
