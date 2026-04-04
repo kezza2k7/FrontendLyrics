@@ -152,6 +152,9 @@ const PORT = Number(process.env.PORT || 3000);
 const spotifyMetaCache = new Map<string, { data: SpotifyTrackMeta; expiresAt: number }>();
 const SPOTIFY_META_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
+// In-memory cache for SpicyLyrics version
+let cachedSpicyLyricsVersion: string | null = null;
+
 const LOG_ENABLED = process.env.BACKEND_LOGGING !== "false";
 const LOCAL_TTML_DIR = process.env.TTML_DIR?.trim() || "TTML";
 const SPICYLYRICS_UPSTREAM_BASE_URL = process.env.SPICYLYRICS_UPSTREAM_BASE_URL?.trim() || "https://api.spicylyrics.org";
@@ -250,6 +253,34 @@ function resolveAppleAuth(params: {
     "";
 
   return { authorization, userToken };
+}
+
+async function getCachedSpicyLyricsVersion(): Promise<string> {
+  // Return cached version if available
+  if (cachedSpicyLyricsVersion !== null) {
+    return cachedSpicyLyricsVersion;
+  }
+
+  try {
+    // Try to read the project version from the config file
+    const configPath = path.resolve(process.cwd(), "project", "config.ts");
+    const configContent = await readFile(configPath, "utf8");
+    
+    // Extract version using regex: export const ProjectVersion = "5.22.2";
+    const match = configContent.match(/export\s+const\s+ProjectVersion\s*=\s*["']([^"']+)["']/);
+    if (match && match[1]) {
+      cachedSpicyLyricsVersion = match[1];
+      logInfo("version", "Loaded SpicyLyrics version from config file", { version: cachedSpicyLyricsVersion });
+      return cachedSpicyLyricsVersion;
+    }
+  } catch (error) {
+    logWarn("version", "Failed to load version from project config file", { error: String(error) });
+  }
+
+  // Fallback to environment variable or default
+  const envVersion = process.env.SPICYLYRICS_VERSION || "unknown";
+  cachedSpicyLyricsVersion = envVersion;
+  return envVersion;
 }
 
 function toSeconds(value: string | number | undefined): number {
