@@ -5,6 +5,92 @@ import { toSeconds } from "../utils.js";
 import { fetchJsonWithFallback } from "../fetch.js";
 import { normalizeLineTiming } from "./timing.js";
 
+const spotifyCanonicalIdCache = new Map<string, { id: string; expiresAt: number }>();
+
+export function normalizeSpotifyTrackId(trackId?: string): string {
+  if (!trackId) return "";
+  const value = trackId.trim();
+  if (!value) return "";
+
+  if (value.startsWith("isrc-") || value.startsWith("spotify-")) {
+    return value;
+  }
+
+  if (value.startsWith("spotify:track:")) {
+    return value.slice("spotify:track:".length);
+  }
+
+  const urlMatch = value.match(/open\.spotify\.com\/track\/([A-Za-z0-9]+)/i);
+  if (urlMatch?.[1]) {
+    return urlMatch[1];
+  }
+
+  return value;
+}
+
+function parseSpotifyIdentity(data: unknown): { spotifyTrackId: string; isrc: string } {
+  if (typeof data !== "object" || data === null) {
+    return { spotifyTrackId: "", isrc: "" };
+  }
+
+  const parsed = data as {
+    id?: string;
+    linked_from?: { id?: string };
+    external_ids?: { isrc?: string };
+  };
+
+  const isrc = typeof parsed.external_ids?.isrc === "string" ? parsed.external_ids.isrc.trim().toUpperCase() : "";
+  const linked = normalizeSpotifyTrackId(parsed.linked_from?.id);
+  const direct = normalizeSpotifyTrackId(parsed.id);
+
+  return {
+    spotifyTrackId: linked || direct,
+    isrc,
+  };
+}
+
+export async function resolveCanonicalLyricsSongId(params: {
+  trackId?: string;
+  authorization?: string;
+}): Promise<string> {
+  const normalizedInput = normalizeSpotifyTrackId(params.trackId);
+  if (!normalizedInput) return "";
+
+  if (normalizedInput.startsWith("isrc-") || normalizedInput.startsWith("spotify-")) {
+    return normalizedInput;
+  }
+
+  const cached = spotifyCanonicalIdCache.get(normalizedInput);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.id;
+  }
+
+  let canonical = `spotify-${normalizedInput}`;
+
+  if (params.authorization) {
+    const result = await fetchSpotifyTrackFromMainApi({
+      trackId: normalizedInput,
+      authorization: params.authorization,
+    });
+
+    if (result.ok) {
+      const identity = parseSpotifyIdentity(result.data);
+      canonical = identity.isrc
+        ? `isrc-${identity.isrc}`
+        : identity.spotifyTrackId
+          ? `spotify-${identity.spotifyTrackId}`
+          : canonical;
+    }
+  }
+
+  spotifyCanonicalIdCache.set(normalizedInput, {
+    id: canonical,
+    expiresAt: Date.now() + SPOTIFY_META_CACHE_TTL_MS,
+  });
+
+  return canonical;
+}
+
 export function toSpotifyTrackMeta(trackId: string, data: unknown): SpotifyTrackMeta | null {
   if (typeof data !== "object" || data === null) return null;
 

@@ -12,6 +12,8 @@ import {
 import {
   askSpotifyForLyrics,
   getSpotifyTrackMeta,
+  normalizeSpotifyTrackId,
+  resolveCanonicalLyricsSongId,
   transformSpotifyToSpicyLyrics,
 } from "./lyrics/spotify.js";
 import { normalizeLyricsForClient, normalizeSpicyLyricsPayload } from "./lyrics/normalize.js";
@@ -32,21 +34,26 @@ export async function handleQueryOperation(
   });
 
   if (operation === "lyrics") {
-    const trackId = variables.id || variables.trackId;
+    const trackId = normalizeSpotifyTrackId(variables.id || variables.trackId);
     const spotifyToken = pickAuthTokenFromQuery(variables, carrier);
+    const canonicalSongId = await resolveCanonicalLyricsSongId({
+      trackId,
+      authorization: spotifyToken,
+    });
+    const storageId = canonicalSongId || trackId;
 
     // 1. Local TTML (highest priority — covers TTML XML and pre-parsed WBW JSON sidecars)
-    const localLyrics = await getLocalTtmlLyrics(trackId);
+    const localLyrics = await getLocalTtmlLyrics(storageId);
     if (localLyrics) {
-      return { data: normalizeLyricsForClient(localLyrics, trackId), httpStatus: 200, format: "json" };
+      return { data: normalizeLyricsForClient(localLyrics, storageId), httpStatus: 200, format: "json" };
     }
 
     // 2. Cache check
     if (trackId) {
-      const cached = await getLyricsFromCache(trackId);
+      const cached = await getLyricsFromCache(storageId);
       if (cached) {
-        logInfo("query", "Returning lyrics from cache", { operation, trackId, type: cached.Type });
-        return { data: normalizeLyricsForClient(cached, trackId), httpStatus: 200, format: "json" };
+        logInfo("query", "Returning lyrics from cache", { operation, trackId, storageId, type: cached.Type });
+        return { data: normalizeLyricsForClient(cached, storageId), httpStatus: 200, format: "json" };
       }
     }
 
@@ -63,22 +70,23 @@ export async function handleQueryOperation(
     });
 
     if (upstreamLyrics && upstreamLyrics.httpStatus === 200) {
-      const normalizedUpstream = normalizeSpicyLyricsPayload(upstreamLyrics.data, trackId) as SpicyLineLyrics | SpicySyllableLyrics | null;
-      const result = normalizedUpstream ?? (normalizeLyricsForClient(upstreamLyrics.data, trackId) as SpicyLineLyrics | SpicySyllableLyrics);
+      const normalizedUpstream = normalizeSpicyLyricsPayload(upstreamLyrics.data, storageId) as SpicyLineLyrics | SpicySyllableLyrics | null;
+      const result = normalizedUpstream ?? (normalizeLyricsForClient(upstreamLyrics.data, storageId) as SpicyLineLyrics | SpicySyllableLyrics);
       const isWBW = result.Type === "Syllable";
       logInfo("query", "Returning lyrics from SpicyLyrics upstream", {
         operation,
         trackId,
+        storageId,
         wordByWord: isWBW,
       });
 
       if (trackId) {
         if (isWBW) {
           // Word-by-word → persist to local TTML dir (becomes the top-priority source next request)
-          await writeLocalLyricsJson(trackId, result);
+          await writeLocalLyricsJson(storageId, result);
         } else {
           // Line-only → persist to regular cache
-          await writeLyricsToCache(trackId, result);
+          await writeLyricsToCache(storageId, result);
         }
       }
 
@@ -137,9 +145,9 @@ export async function handleQueryOperation(
       });
 
       if (appleResult.httpStatus === 200) {
-        const transformedApple = transformAppleToSpicyLyrics(appleResult.data, trackId || appleSongId);
+        const transformedApple = transformAppleToSpicyLyrics(appleResult.data, storageId || appleSongId);
         if (transformedApple) {
-          const normalized = normalizeLyricsForClient(transformedApple, trackId || appleSongId) as SpicyLineLyrics | SpicySyllableLyrics;
+          const normalized = normalizeLyricsForClient(transformedApple, storageId || appleSongId) as SpicyLineLyrics | SpicySyllableLyrics;
           const wordByWord = isAppleWordByWord(appleResult.data);
           logInfo("query", "Returning Apple lyrics result", {
             operation,
@@ -147,7 +155,7 @@ export async function handleQueryOperation(
             lineCount: transformedApple.Content.length,
             wordByWord,
           });
-          if (trackId) await writeLyricsToCache(trackId, normalized);
+          if (trackId) await writeLyricsToCache(storageId, normalized);
           return { data: normalized, httpStatus: 200, format: "json" };
         }
 
@@ -181,10 +189,11 @@ export async function handleQueryOperation(
       logInfo("query", "Returning Spotify fallback lyrics", {
         operation,
         trackId,
+        storageId,
         lineCount: transformedSpotify.Content.length,
       });
       return {
-        data: normalizeLyricsForClient(transformedSpotify, trackId),
+        data: normalizeLyricsForClient(transformedSpotify, storageId),
         httpStatus: spotifyResult.httpStatus,
         format: "json",
       };
@@ -195,8 +204,13 @@ export async function handleQueryOperation(
   }
 
   if (operation === "spotifyLyrics") {
-    const trackId = variables.id || variables.trackId;
+    const trackId = normalizeSpotifyTrackId(variables.id || variables.trackId);
     const spotifyToken = pickAuthTokenFromQuery(variables, carrier);
+    const canonicalSongId = await resolveCanonicalLyricsSongId({
+      trackId,
+      authorization: spotifyToken,
+    });
+    const storageId = canonicalSongId || trackId;
 
     const upstreamLyrics = await fetchAndStoreSpicyLyricsUpstreamResult({
       source: "query",
@@ -210,21 +224,22 @@ export async function handleQueryOperation(
     });
 
     if (upstreamLyrics && upstreamLyrics.httpStatus === 200) {
-      const normalizedUpstreamLyrics = normalizeSpicyLyricsPayload(upstreamLyrics.data, trackId);
+      const normalizedUpstreamLyrics = normalizeSpicyLyricsPayload(upstreamLyrics.data, storageId);
       logInfo("query", "Returning spotifyLyrics from hosted SpicyLyrics upstream", {
         operation,
         trackId,
+        storageId,
         normalized: Boolean(normalizedUpstreamLyrics),
       });
       if (normalizedUpstreamLyrics) {
         return { ...upstreamLyrics, data: normalizedUpstreamLyrics, format: "json" };
       }
-      return { ...upstreamLyrics, data: normalizeLyricsForClient(upstreamLyrics.data, trackId) };
+      return { ...upstreamLyrics, data: normalizeLyricsForClient(upstreamLyrics.data, storageId) };
     }
 
-    const localLyrics = await getLocalTtmlLyrics(trackId);
+    const localLyrics = await getLocalTtmlLyrics(storageId);
     if (localLyrics) {
-      return { data: normalizeLyricsForClient(localLyrics, trackId), httpStatus: 200, format: "json" };
+      return { data: normalizeLyricsForClient(localLyrics, storageId), httpStatus: 200, format: "json" };
     }
 
     const spotifyResult = await askSpotifyForLyrics({
@@ -234,14 +249,15 @@ export async function handleQueryOperation(
     });
 
     if (spotifyResult.httpStatus === 200) {
-      const transformedSpotify = transformSpotifyToSpicyLyrics(spotifyResult.data, trackId);
+      const transformedSpotify = transformSpotifyToSpicyLyrics(spotifyResult.data, storageId);
       logInfo("query", "Returning Spotify-only lyrics", {
         operation,
         trackId,
+        storageId,
         lineCount: transformedSpotify.Content.length,
       });
       return {
-        data: normalizeLyricsForClient(transformedSpotify, trackId),
+        data: normalizeLyricsForClient(transformedSpotify, storageId),
         httpStatus: spotifyResult.httpStatus,
         format: "json",
       };
@@ -251,7 +267,7 @@ export async function handleQueryOperation(
   }
 
   if (operation === "appleLyrics") {
-    const appleTrackId = variables.id || variables.trackId;
+    const appleTrackId = normalizeSpotifyTrackId(variables.id || variables.trackId);
     const localLyrics = await getLocalTtmlLyrics(appleTrackId);
     if (localLyrics) {
       return {

@@ -11,7 +11,12 @@ import {
   isAppleWordByWord,
   transformAppleToSpicyLyrics,
 } from "./lyrics/apple.js";
-import { askSpotifyForLyrics, transformSpotifyToSpicyLyrics } from "./lyrics/spotify.js";
+import {
+  askSpotifyForLyrics,
+  normalizeSpotifyTrackId,
+  resolveCanonicalLyricsSongId,
+  transformSpotifyToSpicyLyrics,
+} from "./lyrics/spotify.js";
 import { normalizeLyricsForClient, normalizeSpicyLyricsPayload } from "./lyrics/normalize.js";
 import { fetchAndStoreSpicyLyricsUpstreamResult } from "./snapshot.js";
 import { handleQueryOperation } from "./query.js";
@@ -46,8 +51,13 @@ app.get("/health", (_req: Request, res: Response) => {
 
 app.post("/spotify/lyrics", async (req: Request<unknown, unknown, SpotifyLyricsRequest>, res: Response) => {
   try {
-    const trackId = req.body?.trackId;
+    const trackId = normalizeSpotifyTrackId(req.body?.trackId);
     const spotifyToken = pickAuthTokenFromQuery({}, req);
+    const canonicalSongId = await resolveCanonicalLyricsSongId({
+      trackId,
+      authorization: spotifyToken,
+    });
+    const storageId = canonicalSongId || trackId;
 
     const upstreamLyrics = await fetchAndStoreSpicyLyricsUpstreamResult({
       source: "route",
@@ -60,19 +70,24 @@ app.post("/spotify/lyrics", async (req: Request<unknown, unknown, SpotifyLyricsR
     });
 
     if (upstreamLyrics && upstreamLyrics.httpStatus === 200) {
-      const normalizedUpstreamLyrics = normalizeSpicyLyricsPayload(upstreamLyrics.data, trackId);
+      const normalizedUpstreamLyrics = normalizeSpicyLyricsPayload(upstreamLyrics.data, storageId);
       logInfo("route", "POST /spotify/lyrics served by hosted SpicyLyrics upstream", {
         trackId,
+        storageId,
         normalized: Boolean(normalizedUpstreamLyrics),
       });
-      res.status(200).json(normalizedUpstreamLyrics ?? normalizeLyricsForClient(upstreamLyrics.data, trackId));
+      res.status(200).json(normalizedUpstreamLyrics ?? normalizeLyricsForClient(upstreamLyrics.data, storageId));
       return;
     }
 
-    const localLyrics = await getLocalTtmlLyrics(trackId);
+    const localLyrics = await getLocalTtmlLyrics(storageId);
     if (localLyrics) {
-      logInfo("route", "POST /spotify/lyrics served by local TTML", { trackId, type: localLyrics.Type });
-      res.status(200).json(normalizeLyricsForClient(localLyrics, trackId));
+      logInfo("route", "POST /spotify/lyrics served by local TTML", {
+        trackId,
+        storageId,
+        type: localLyrics.Type,
+      });
+      res.status(200).json(normalizeLyricsForClient(localLyrics, storageId));
       return;
     }
 
@@ -88,7 +103,7 @@ app.post("/spotify/lyrics", async (req: Request<unknown, unknown, SpotifyLyricsR
       .status(result.httpStatus)
       .json(
         result.httpStatus === 200
-          ? normalizeLyricsForClient(transformSpotifyToSpicyLyrics(result.data, trackId), trackId)
+          ? normalizeLyricsForClient(transformSpotifyToSpicyLyrics(result.data, storageId), storageId)
           : result.data
       );
   } catch (error) {
