@@ -69,6 +69,18 @@ function devSettings(SettingsSection: any) {
 function generalSettings(SettingsSection: any) {
   const settings = new SettingsSection("Spicy Lyrics", "spicy-lyrics-settings");
 
+  settings.addDropDown(
+    "lyrics-api-mode",
+    "Lyrics API Server",
+    ["Hosted (https://api.spicylyrics.org)", "Local (http://localhost:3000)"],
+    storage.get("lyricsApiMode")?.toString() === "Local" ? 1 : 0,
+    () => {
+      const selected = settings.getFieldValue("lyrics-api-mode") as string;
+      const mode = selected.startsWith("Local") ? "Local" : "Hosted";
+      storage.set("lyricsApiMode", mode);
+    }
+  );
+
   settings.addToggle(
     "static-background",
     "Static Background",

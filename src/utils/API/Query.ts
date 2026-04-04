@@ -44,7 +44,8 @@ export async function Query(
   queries: Query[],
   headers: Record<string, string> = {}
 ): Promise<QueryResultGetter> {
-  const host = Defaults.lyrics.api.url;
+  const apiMode = storage.get("lyricsApiMode")?.toString() ?? "Hosted";
+  const host = apiMode === "Local" ? Defaults.lyrics.api.localUrl : Defaults.lyrics.api.hostedUrl;
   const clientVersion = Session.SpicyLyrics.GetCurrentVersion();
 
   log.info("Sending Query request", { queries, host, clientVersion: clientVersion?.Text, headers });

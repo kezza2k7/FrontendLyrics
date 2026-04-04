@@ -165,6 +165,10 @@ export default async function fetchLyrics(uri: string): Promise<[object | string
     let lyricsText = "";
     let status = 0;
 
+    const trackName = SpotifyPlayer.GetName();
+    const trackArtists = SpotifyPlayer.GetArtists()?.map((a) => a.name).filter(Boolean) ?? [];
+    const trackDurationMs = SpotifyPlayer.GetDuration();
+
     const queries = await Query(
       [
         {
@@ -172,6 +176,9 @@ export default async function fetchLyrics(uri: string): Promise<[object | string
           variables: {
             id: trackId,
             auth: "SpicyLyrics-WebAuth",
+            trackName,
+            trackArtists,
+            trackDurationMs,
           },
         },
       ],
