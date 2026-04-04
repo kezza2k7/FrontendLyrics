@@ -1,13 +1,13 @@
-# Spicy Lyrics
+# FrontendLyrics
 
 ### Check out our *[Sitee](https://yoursit.ee/lyrics)*
 #### Make your own at -> [https://yoursit.ee](https://yoursit.ee)
 
-# How to install Spicy Lyrics
+# How to install FrontendLyrics
 
 ## 1. Using the Spicetify Marketplace (recommended)
-1. Search `Spicy Lyrics` under the "Extensions" tab
-2. Click the Install button on the Spicy Lyrics extension
+1. Search `FrontendLyrics` under the "Extensions" tab
+2. Click the Install button on the FrontendLyrics extension
 3. All done!
 
 ## 2. Externally (not recommended)
@@ -20,14 +20,16 @@
 
 [![Github Version](https://img.shields.io/github/v/release/spikerko/spicy-lyrics)](https://github.com/spikerko/spicy-lyrics/) [![Github Stars badge](https://img.shields.io/github/stars/spikerko/spicy-lyrics?style=social)](https://github.com/spikerko/spicy-lyrics/) [![Discord Badge](https://dcbadge.limes.pink/api/server/uqgXU5wh8j?style=flat)](https://discord.com/invite/uqgXU5wh8j)
 
-Hi, I'm Spikerko (the person who made this repo). I've been really passionate about this project, and I'm really happy for this project.
+This repository is a separate fork project named FrontendLyrics.
 
-I've seen a problem with the Spotify Lyrics. They're plain, just static colors. So I wanted to build my own version. And here it is: **Spicy Lyrics**. Hope you like it!
+FrontendLyrics is inspired by both [Spicy Lyrics](https://github.com/kezza2k7/spicy-lyrics) and [Beautiful Lyrics](https://github.com/surfbryce/beautiful-lyrics).
+
+The base code for this repository was originally taken from Spicy Lyrics, and is now maintained separately here.
 
 ![Extension Example](./previews/page.gif)
 
 
-*Inspired by [Beautiful Lyrics](https://github.com/surfbryce/beautiful-lyrics)*
+*Inspired by [Spicy Lyrics](https://github.com/kezza2k7/spicy-lyrics) and [Beautiful Lyrics](https://github.com/surfbryce/beautiful-lyrics)*
 
 ## TypeScript Backend (Express)
 
