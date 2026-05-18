@@ -1,7 +1,9 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import express, { type Request, type Response } from "express";
+import { access, readFile } from "node:fs/promises";
 import type { IncomingHttpHeaders } from "node:http";
+import path from "node:path";
 
 dotenv.config();
 
@@ -140,6 +142,7 @@ const spotifyMetaCache = new Map<string, { data: SpotifyTrackMeta; expiresAt: nu
 const SPOTIFY_META_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 const LOG_ENABLED = process.env.BACKEND_LOGGING !== "false";
+const LOCAL_TTML_DIR = process.env.TTML_DIR?.trim() || "TTML";
 
 function logInfo(scope: string, message: string, meta?: unknown): void {
   if (!LOG_ENABLED) return;
@@ -579,6 +582,53 @@ function transformAppleToSpicyLyrics(raw: unknown, songId?: string): SpicyLineLy
     IncludesRomanization: false,
     SongWriters: songWriters,
   };
+}
+
+function markAsLocalTtml<T extends SpicyLineLyrics | SpicySyllableLyrics>(lyrics: T): T {
+  return {
+    ...lyrics,
+    Provider: "LocalTTML",
+    ProviderDisplayName: "Local TTML",
+    source: "aml",
+  } as T;
+}
+
+async function getLocalTtmlLyrics(trackId?: string): Promise<SpicyLineLyrics | SpicySyllableLyrics | null> {
+  if (!trackId) return null;
+
+  const candidates = [
+    path.resolve(process.cwd(), LOCAL_TTML_DIR, trackId, "ttml"),
+    path.resolve(process.cwd(), LOCAL_TTML_DIR, trackId, "ttml.xml"),
+    path.resolve(process.cwd(), LOCAL_TTML_DIR, trackId, "lyrics.ttml"),
+  ];
+
+  for (const candidatePath of candidates) {
+    try {
+      await access(candidatePath);
+      const ttmlRaw = await readFile(candidatePath, "utf8");
+      const transformed = transformAppleToSpicyLyrics(ttmlRaw, trackId);
+      if (!transformed) {
+        logWarn("local-ttml", "TTML file found but could not be transformed", {
+          trackId,
+          path: candidatePath,
+        });
+        return null;
+      }
+
+      const localLyrics = markAsLocalTtml(transformed);
+      logInfo("local-ttml", "Using local TTML lyrics override", {
+        trackId,
+        path: candidatePath,
+        type: localLyrics.Type,
+        lineCount: localLyrics.Content.length,
+      });
+      return localLyrics;
+    } catch {
+      // Try next file path candidate.
+    }
+  }
+
+  return null;
 }
 
 function transformSpotifyToSpicyLyrics(raw: unknown, trackId?: string): SpicyLineLyrics {
@@ -1052,6 +1102,15 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
 
   if (operation === "lyrics") {
     const trackId = variables.id || variables.trackId;
+    const localLyrics = await getLocalTtmlLyrics(trackId);
+    if (localLyrics) {
+      return {
+        data: localLyrics,
+        httpStatus: 200,
+        format: "json",
+      };
+    }
+
     const spotifyToken = pickAuthTokenFromQuery(variables, carrier);
     const appleStorefront = variables.appleStorefront || variables.storefront || "gb";
     const appleAuth = resolveAppleAuth({
@@ -1179,6 +1238,15 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
 
   if (operation === "spotifyLyrics") {
     const trackId = variables.id || variables.trackId;
+    const localLyrics = await getLocalTtmlLyrics(trackId);
+    if (localLyrics) {
+      return {
+        data: localLyrics,
+        httpStatus: 200,
+        format: "json",
+      };
+    }
+
     const spotifyResult = await askSpotifyForLyrics({
       trackId,
       market: variables.market || "from_token",
@@ -1207,6 +1275,15 @@ async function handleQueryOperation(query: QueryInput, carrier: HeaderCarrier): 
   }
 
   if (operation === "appleLyrics") {
+    const localLyrics = await getLocalTtmlLyrics(variables.id || variables.trackId);
+    if (localLyrics) {
+      return {
+        data: localLyrics,
+        httpStatus: 200,
+        format: "json",
+      };
+    }
+
     const appleAuth = resolveAppleAuth({
       carrier,
       developerToken: variables.appleDeveloperToken,
@@ -1266,6 +1343,16 @@ app.get("/health", (_req: Request, res: Response) => {
 app.post("/spotify/lyrics", async (req: Request<unknown, unknown, SpotifyLyricsRequest>, res: Response) => {
   try {
     const trackId = req.body?.trackId;
+    const localLyrics = await getLocalTtmlLyrics(trackId);
+    if (localLyrics) {
+      logInfo("route", "POST /spotify/lyrics served by local TTML", {
+        trackId,
+        type: localLyrics.Type,
+      });
+      res.status(200).json(localLyrics);
+      return;
+    }
+
     const result = await askSpotifyForLyrics({
       trackId,
       market: req.body?.market || "from_token",
